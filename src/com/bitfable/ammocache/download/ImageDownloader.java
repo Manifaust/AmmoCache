@@ -27,6 +27,9 @@ import java.net.URL;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.util.Log;
@@ -92,15 +95,48 @@ public class ImageDownloader {
 	            .getMethod("install", File.class, long.class)
 	            .invoke(null, httpCacheDir, httpCacheSize);
 	    } catch (Exception httpResponseCacheNotAvailable) {
+	    	Log.v(TAG, "HttpResponseCache is not available");
 	    }
 	}
 	
 	public void download(String imageUrl, ImageView imageView) {
-		new ImageDownloadTask(imageUrl, imageView).execute();
+	     if (cancelPotentialDownload(imageUrl, imageView)) {
+	         ImageDownloadTask task = new ImageDownloadTask(imageUrl, imageView);
+	         DownloadedDrawable downloadedDrawable = new DownloadedDrawable(task);
+	         imageView.setImageDrawable(downloadedDrawable);
+	         task.execute();
+	     }
 	}
+	
+	private static boolean cancelPotentialDownload(String url, ImageView imageView) {
+		ImageDownloadTask downloadTask = getDownloadTask(imageView);
 
+	    if (downloadTask != null) {
+	        String bitmapUrl = downloadTask.url;
+	        if ((bitmapUrl == null) || (!bitmapUrl.equals(url))) {
+	            downloadTask.cancel(true);
+	        } else {
+	            // The same URL is already being downloaded.
+	            return false;
+	        }
+	    }
+	    return true;
+	}
+	
+	private static ImageDownloadTask getDownloadTask(ImageView imageView) {
+	    if (imageView != null) {
+	        Drawable drawable = imageView.getDrawable();
+	        if (drawable instanceof DownloadedDrawable) {
+	            DownloadedDrawable downloadedDrawable = (DownloadedDrawable)drawable;
+	            return downloadedDrawable.getDownloadTask();
+	        }
+	    }
+	    return null;
+	}
+	
     private static Bitmap downloadImage(String imageUrl) {
     	URL url;
+    	
 		try {
 			url = new URL(imageUrl);
 		} catch (MalformedURLException e) {
@@ -129,32 +165,47 @@ public class ImageDownloader {
     	return bitmap;
     }
 
-    public static class ImageDownloadTask extends AsyncTask<Void, Void, Bitmap> {
-    	private String mImageUrl;
+    private static final class ImageDownloadTask extends AsyncTask<Void, Void, Bitmap> {
+    	String url;
     	private WeakReference<ImageView> mImageViewReference;
 
 		public ImageDownloadTask(String imageUrl, ImageView imageView) {
-    		mImageUrl = imageUrl;
+    		url = imageUrl;
     		mImageViewReference = new WeakReference<ImageView>(imageView);
     	}
 
 		@Override
 		protected Bitmap doInBackground(Void... params) {
-			return downloadImage(mImageUrl);
+			return downloadImage(url);
 		}
     	
 		@Override
 		protected void onPostExecute(Bitmap bitmap) {
+			if (isCancelled()) bitmap = null;
+			
 			if (bitmap != null) {
-				ImageView imageView = mImageViewReference.get();
-				if (imageView != null) {
-					imageView.setImageBitmap(bitmap);
-				} else {
-					Log.w(TAG, "ImageView reference has been garbage collected");
-				}
+			    ImageView imageView = mImageViewReference.get();
+			    ImageDownloadTask bitmapDownloaderTask = getDownloadTask(imageView);
+			    // Change bitmap only if this process is still associated with it
+			    if (this == bitmapDownloaderTask) {
+			        imageView.setImageBitmap(bitmap);
+			    }
 			} else {
-				Log.w(TAG, "could not download bitmap");
+				Log.w(TAG, "could not download bitmap: " + url);
 			}
 		}
+    }
+    
+    private static final class DownloadedDrawable extends ColorDrawable {
+        private final WeakReference<ImageDownloadTask> downloadTaskReference;
+
+        public DownloadedDrawable(ImageDownloadTask downloadTask) {
+            super(Color.TRANSPARENT);
+            downloadTaskReference = new WeakReference<ImageDownloadTask>(downloadTask);
+        }
+
+        public ImageDownloadTask getDownloadTask() {
+            return downloadTaskReference.get();
+        }
     }
 }
