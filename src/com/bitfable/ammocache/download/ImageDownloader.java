@@ -49,9 +49,9 @@ import com.bitfable.ammocache.io.FlushedInputStream;
  * Use this class to download images and load them onto ImageView instances.
  * You can configure the HTTP cache size used by changing
  * {@link #HTTP_CACHE_SIZE}. In-memory cache size item count limit can be
- * configured by changing {@link #HARD_CACHE_CAPACITY}. Right now the in-memory
- * cache is set to purge itself every {@value #DELAY_BEFORE_PURGE} seconds. This
- * can set by changing {@link #DELAY_BEFORE_PURGE}.
+ * configured by changing {@link #HARD_CACHE_CAPACITY}. In-memory LRU cache can
+ * be set to auto-purge itself to save meory. This is configured with
+ * {@link #DELAY_BEFORE_PURGE}.
  * 
  * Many of the network optimizations in this code came from an Android Developer
  * Blog article by Jesse Wilson:
@@ -76,6 +76,17 @@ public class ImageDownloader {
 	 */
 	private static final int PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI = 500;
 	
+	/**
+	 * Max number of items allowed inside in-memory LRU cache
+	 */
+    private static final int HARD_CACHE_CAPACITY = 32;
+    
+    /**
+     * Amount of time of inactivity to wait before purging in-memory cache, set
+     * to -1 for no auto-purging
+     */
+    private static final int DELAY_BEFORE_PURGE = -1; // 10 * 1000; // in milliseconds
+
 	private static final int BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE = 1048;
 	private static final String CACHE_FILE_NAME = "image_downloader_cache";
 	private static final String TAG = "ImageDownloader";
@@ -322,11 +333,8 @@ public class ImageDownloader {
      * Garbage Collector.
      */
     
-    private static final int HARD_CACHE_CAPACITY = 32;
-    private static final int DELAY_BEFORE_PURGE = 10 * 1000; // in milliseconds
-
     // Hard cache, with a fixed maximum capacity and a life duration
-    private final HashMap<String, Bitmap> sHardBitmapCache =
+    private HashMap<String, Bitmap> sHardBitmapCache =
         new LinkedHashMap<String, Bitmap>(HARD_CACHE_CAPACITY / 2, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(LinkedHashMap.Entry<String, Bitmap> eldest) {
@@ -340,7 +348,7 @@ public class ImageDownloader {
     };
 
     // Soft cache for bitmaps kicked out of hard cache
-    private final static ConcurrentHashMap<String, SoftReference<Bitmap>> sSoftBitmapCache =
+    private ConcurrentHashMap<String, SoftReference<Bitmap>> sSoftBitmapCache =
         new ConcurrentHashMap<String, SoftReference<Bitmap>>(HARD_CACHE_CAPACITY / 2);
 
     private final Handler purgeHandler = new Handler();
@@ -409,6 +417,8 @@ public class ImageDownloader {
      * Allow a new delay before the automatic cache clear is done.
      */
     private void resetPurgeTimer() {
+    	if (DELAY_BEFORE_PURGE < 0) return;
+    	
         purgeHandler.removeCallbacks(purger);
         purgeHandler.postDelayed(purger, DELAY_BEFORE_PURGE);
     }
