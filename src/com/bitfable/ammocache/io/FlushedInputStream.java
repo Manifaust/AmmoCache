@@ -16,7 +16,7 @@
 
 package com.bitfable.ammocache.io;
 
-import java.io.FilterInputStream;
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -25,7 +25,7 @@ import java.io.InputStream;
  * don't work well with the regular InputStream class when using a slow
  * connection. This class is meant to fix that problem.
  */
-public class FlushedInputStream extends FilterInputStream {
+public class FlushedInputStream extends BufferedInputStream {
     public FlushedInputStream(InputStream inputStream) {
         super(inputStream);
     }

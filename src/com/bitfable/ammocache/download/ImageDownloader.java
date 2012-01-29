@@ -24,6 +24,8 @@ import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
 
+import org.apache.http.util.ByteArrayBuffer;
+
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -32,6 +34,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.AsyncTask;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
 import android.widget.ImageView;
 
@@ -48,13 +51,13 @@ import com.bitfable.ammocache.io.FlushedInputStream;
  * 
  */
 public class ImageDownloader {
+	private static final int BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE = 1048;
 	private static final String TAG = "ImageDownloader";
 	private static final long CACHE_SIZE = 10 * 1024 * 1024; // 10 MiB
 	private static final String CACHE_FILE_NAME = "image_downloader_cache";
 	
-	public ImageDownloader() {
-		this(null);
-	}
+	@SuppressWarnings("unused")
+	private ImageDownloader() { }
 	
 	public ImageDownloader(Context context) {
 		disableConnectionReuseIfNecessary();
@@ -100,8 +103,12 @@ public class ImageDownloader {
 	}
 	
 	public void download(String imageUrl, ImageView imageView) {
+		download(imageUrl, imageView, null);
+	}
+	
+	public void download(String imageUrl, ImageView imageView, ProgressListener progressListener) {
 	     if (cancelPotentialDownload(imageUrl, imageView)) {
-	         ImageDownloadTask task = new ImageDownloadTask(imageUrl, imageView);
+	         ImageDownloadTask task = new ImageDownloadTask(imageUrl, imageView, progressListener);
 	         DownloadedDrawable downloadedDrawable = new DownloadedDrawable(task);
 	         imageView.setImageDrawable(downloadedDrawable);
 	         task.execute();
@@ -134,49 +141,33 @@ public class ImageDownloader {
 	    return null;
 	}
 	
-    private static Bitmap downloadImage(String imageUrl) {
-    	URL url;
-    	
-		try {
-			url = new URL(imageUrl);
-		} catch (MalformedURLException e) {
-			Log.e(TAG, "url is malformed: " + imageUrl, e);
-			return null;
-		}
-		
-    	HttpURLConnection urlConnection;
-		try {
-			urlConnection = (HttpURLConnection) url.openConnection();
-		} catch (IOException e) {
-			Log.e(TAG, "error while opening connection", e);
-			return null;
-		}
-		
-    	Bitmap bitmap = null;
-    	try {
-    		InputStream in = new FlushedInputStream(urlConnection.getInputStream());
-    	    bitmap = BitmapFactory.decodeStream(in);
-    	} catch (IOException e) {
-			Log.e(TAG, "error creating InputStream", e);
-		} finally {
-			if (urlConnection != null) urlConnection.disconnect();
-		}
-
-    	return bitmap;
-    }
-
     private static final class ImageDownloadTask extends AsyncTask<Void, Void, Bitmap> {
-    	String url;
+    	private static final int PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI = 500;
+		String url;
     	private WeakReference<ImageView> mImageViewReference;
+    	private int mBytesDownloaded;
+		private int mContentLength;
+		private ProgressListener mProgressListener;
+		private long mTimeBegin;
 
-		public ImageDownloadTask(String imageUrl, ImageView imageView) {
+		public ImageDownloadTask(String imageUrl, ImageView imageView, ProgressListener progressListener) {
     		url = imageUrl;
     		mImageViewReference = new WeakReference<ImageView>(imageView);
-    	}
+    		mProgressListener = progressListener;
+    		mTimeBegin = SystemClock.elapsedRealtime();
+		}
 
 		@Override
 		protected Bitmap doInBackground(Void... params) {
 			return downloadImage(url);
+		}
+		
+		@Override
+		protected void onProgressUpdate(Void... values) {
+			if (mContentLength <= 0 || mProgressListener == null) return;
+			
+			long timeNow = SystemClock.elapsedRealtime();
+			mProgressListener.onProgressUpdated(mBytesDownloaded * 100 / mContentLength, timeNow - mTimeBegin);
 		}
     	
 		@Override
@@ -194,6 +185,59 @@ public class ImageDownloader {
 				Log.w(TAG, "could not download bitmap: " + url);
 			}
 		}
+		
+	    private Bitmap downloadImage(String imageUrl) {
+	    	URL url;
+	    	
+			try {
+				url = new URL(imageUrl);
+			} catch (MalformedURLException e) {
+				Log.e(TAG, "url is malformed: " + imageUrl, e);
+				return null;
+			}
+			
+	    	HttpURLConnection urlConnection;
+			try {
+				urlConnection = (HttpURLConnection) url.openConnection();
+			} catch (IOException e) {
+				Log.e(TAG, "error while opening connection", e);
+				return null;
+			}
+			
+	    	Bitmap bitmap = null;
+	    	InputStream httpStream = null;
+	    	try {
+	    		mContentLength = urlConnection.getContentLength();
+	    		httpStream = new FlushedInputStream(urlConnection.getInputStream());
+	    		ByteArrayBuffer baf = new ByteArrayBuffer(BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE);
+	    		byte[] buffer = new byte[BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE];
+	    		while (!isCancelled()) {
+	    			int incrementalRead = httpStream.read(buffer);
+	    			if (incrementalRead == -1) {
+	    				break;
+	    			}
+	    			mBytesDownloaded += incrementalRead;
+	    			if (SystemClock.elapsedRealtime() - mTimeBegin > PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI
+	    					|| mBytesDownloaded == mContentLength) {
+	    				publishProgress();
+	    			}
+	    			baf.append(buffer, 0, incrementalRead);
+	    		}
+
+	    		if (isCancelled()) return null;
+	    		
+	    	    bitmap = BitmapFactory.decodeByteArray(baf.toByteArray(), 0, baf.length());
+	    	} catch (IOException e) {
+				Log.e(TAG, "error creating InputStream", e);
+			} finally {
+				if (urlConnection != null) urlConnection.disconnect();
+				if (httpStream != null) {
+					try { httpStream.close(); } catch (IOException e) { Log.e(TAG, "IOException while closing http stream", e); }
+				}
+			}
+
+	    	return bitmap;
+	    }
     }
     
     private static final class DownloadedDrawable extends ColorDrawable {
@@ -207,5 +251,17 @@ public class ImageDownloader {
         public ImageDownloadTask getDownloadTask() {
             return downloadTaskReference.get();
         }
+    }
+    
+    public static interface ProgressListener {
+    	/**
+    	 * Progress callback for the download so far. This will be called on the
+    	 * main thread so it must return quickly.
+    	 * @param progressPercentage the progress of the download so far, could
+    	 * be greater than 100 if content-length is reported incorrectly. If
+    	 * content length is missing or 0, this progress will always read -1
+    	 * @param timeElapsedMilli the time used so far for downloading
+    	 */
+    	void onProgressUpdated(int progressPercentage, long timeElapsedMilli);
     }
 }
