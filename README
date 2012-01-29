@@ -1,7 +1,9 @@
-AmmoCache is an Android image cache. The downloader has an HTTP layer cache that
-you can configure in ImageDownloader.java using the CACHE_SIZE constant.
+AmmoCache is an Android image cache. Please look at LaunchActivity.java and
+ExampleImageAdapter.java to see example usage. Configuration constants are
+located in ImgaeDownloader.java, please look at its class documentation for more
+detail.
 
-It is released under the Apache License Version 2.0.
+This source code is released under the Apache License Version 2.0.
 
 Tony Wong
 manifaust@gmail.com

@@ -19,10 +19,14 @@ package com.bitfable.ammocache.download;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.ref.SoftReference;
 import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.http.util.ByteArrayBuffer;
 
@@ -34,6 +38,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.AsyncTask;
 import android.os.Build;
+import android.os.Handler;
 import android.os.SystemClock;
 import android.util.Log;
 import android.widget.ImageView;
@@ -42,19 +47,38 @@ import com.bitfable.ammocache.io.FlushedInputStream;
 
 /**
  * Use this class to download images and load them onto ImageView instances.
- * You can configure the HTTP cache size used by modifying {@link #CACHE_SIZE}
+ * You can configure the HTTP cache size used by changing
+ * {@link #HTTP_CACHE_SIZE}. In-memory cache size item count limit can be
+ * configured by changing {@link #HARD_CACHE_CAPACITY}. Right now the in-memory
+ * cache is set to purge itself every {@value #DELAY_BEFORE_PURGE} seconds. This
+ * can set by changing {@link #DELAY_BEFORE_PURGE}.
  * 
- * Many of the optimizations in this code came from an Android Developer Blog
- * article by Jesse Wilson:
+ * Many of the network optimizations in this code came from an Android Developer
+ * Blog article by Jesse Wilson:
  * 
  * http://android-developers.blogspot.com/2011/09/androids-http-clients.html
  * 
+ * The {@link AsyncTask} workflow and in-memory cache is based on code from
+ * Gilles Debunne:
+ * 
+ * http://android-developers.blogspot.com/2010/07/multithreading-for-performance.html
+ * http://code.google.com/p/android-imagedownloader/
+ * 
  */
 public class ImageDownloader {
+	/**
+	 * The size of the cache shared by {@link HttpURLConnection}
+	 */
+	private static final long HTTP_CACHE_SIZE = 5 * 1024 * 1024; // 5 MiB
+	
+	/**
+	 * Minimum amount of time between updates for the {@link ProgressListener}
+	 */
+	private static final int PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI = 500;
+	
 	private static final int BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE = 1048;
-	private static final String TAG = "ImageDownloader";
-	private static final long CACHE_SIZE = 10 * 1024 * 1024; // 10 MiB
 	private static final String CACHE_FILE_NAME = "image_downloader_cache";
+	private static final String TAG = "ImageDownloader";
 	
 	@SuppressWarnings("unused")
 	private ImageDownloader() { }
@@ -92,7 +116,7 @@ public class ImageDownloader {
 		}
 		
 	    try {
-	        long httpCacheSize = CACHE_SIZE;
+	        long httpCacheSize = HTTP_CACHE_SIZE;
 	        File httpCacheDir = new File(cacheDir, CACHE_FILE_NAME);
 	        Class.forName("android.net.http.HttpResponseCache")
 	            .getMethod("install", File.class, long.class)
@@ -107,15 +131,39 @@ public class ImageDownloader {
 	}
 	
 	public void download(String imageUrl, ImageView imageView, ProgressListener progressListener) {
-	     if (cancelPotentialDownload(imageUrl, imageView)) {
+        resetPurgeTimer();
+        Bitmap bitmap = getBitmapFromCache(imageUrl);
+
+        if (bitmap == null) {
+            forceDownload(imageUrl, imageView, progressListener);
+        } else {
+            cancelPotentialDownload(imageUrl, imageView);
+            imageView.setImageBitmap(bitmap);
+            if (progressListener != null) progressListener.onProgressUpdated(100, 0);
+        }
+	}
+	
+
+    /**
+     * Same as download but the image is always downloaded and the cache is not used.
+     * Kept private at the moment as its interest is not clear.
+     */
+    private void forceDownload(String imageUrl, ImageView imageView, ProgressListener progressListener) {
+        // State sanity: url is guaranteed to never be null in DownloadedDrawable and cache keys.
+        if (imageUrl == null) {
+            imageView.setImageDrawable(null);
+            return;
+        }
+
+        if (cancelPotentialDownload(imageUrl, imageView)) {
 	         ImageDownloadTask task = new ImageDownloadTask(imageUrl, imageView, progressListener);
 	         DownloadedDrawable downloadedDrawable = new DownloadedDrawable(task);
 	         imageView.setImageDrawable(downloadedDrawable);
 	         task.execute();
-	     }
-	}
-	
-	private static boolean cancelPotentialDownload(String url, ImageView imageView) {
+        }
+    }
+
+    private static boolean cancelPotentialDownload(String url, ImageView imageView) {
 		ImageDownloadTask downloadTask = getDownloadTask(imageView);
 
 	    if (downloadTask != null) {
@@ -141,8 +189,7 @@ public class ImageDownloader {
 	    return null;
 	}
 	
-    private static final class ImageDownloadTask extends AsyncTask<Void, Void, Bitmap> {
-    	private static final int PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI = 500;
+    private final class ImageDownloadTask extends AsyncTask<Void, Void, Bitmap> {
 		String url;
     	private WeakReference<ImageView> mImageViewReference;
     	private int mBytesDownloaded;
@@ -173,6 +220,8 @@ public class ImageDownloader {
 		@Override
 		protected void onPostExecute(Bitmap bitmap) {
 			if (isCancelled()) bitmap = null;
+			
+			addBitmapToCache(url, bitmap);
 			
 			if (bitmap != null) {
 			    ImageView imageView = mImageViewReference.get();
@@ -264,4 +313,104 @@ public class ImageDownloader {
     	 */
     	void onProgressUpdated(int progressPercentage, long timeElapsedMilli);
     }
+    
+
+    /*
+     * Cache-related fields and methods.
+     * 
+     * We use a hard and a soft cache. A soft reference cache is too aggressively cleared by the
+     * Garbage Collector.
+     */
+    
+    private static final int HARD_CACHE_CAPACITY = 32;
+    private static final int DELAY_BEFORE_PURGE = 10 * 1000; // in milliseconds
+
+    // Hard cache, with a fixed maximum capacity and a life duration
+    private final HashMap<String, Bitmap> sHardBitmapCache =
+        new LinkedHashMap<String, Bitmap>(HARD_CACHE_CAPACITY / 2, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(LinkedHashMap.Entry<String, Bitmap> eldest) {
+            if (size() > HARD_CACHE_CAPACITY) {
+                // Entries push-out of hard reference cache are transferred to soft reference cache
+                sSoftBitmapCache.put(eldest.getKey(), new SoftReference<Bitmap>(eldest.getValue()));
+                return true;
+            } else
+                return false;
+        }
+    };
+
+    // Soft cache for bitmaps kicked out of hard cache
+    private final static ConcurrentHashMap<String, SoftReference<Bitmap>> sSoftBitmapCache =
+        new ConcurrentHashMap<String, SoftReference<Bitmap>>(HARD_CACHE_CAPACITY / 2);
+
+    private final Handler purgeHandler = new Handler();
+
+    private final Runnable purger = new Runnable() {
+        public void run() {
+            clearCache();
+        }
+    };
+
+    /**
+     * Adds this bitmap to the cache.
+     * @param bitmap The newly downloaded bitmap.
+     */
+    private void addBitmapToCache(String url, Bitmap bitmap) {
+        if (bitmap != null) {
+            synchronized (sHardBitmapCache) {
+                sHardBitmapCache.put(url, bitmap);
+            }
+        }
+    }
+
+    /**
+     * @param url The URL of the image that will be retrieved from the cache.
+     * @return The cached bitmap or null if it was not found.
+     */
+    private Bitmap getBitmapFromCache(String url) {
+        // First try the hard reference cache
+        synchronized (sHardBitmapCache) {
+            final Bitmap bitmap = sHardBitmapCache.get(url);
+            if (bitmap != null) {
+                // Bitmap found in hard cache
+                // Move element to first position, so that it is removed last
+                sHardBitmapCache.remove(url);
+                sHardBitmapCache.put(url, bitmap);
+                return bitmap;
+            }
+        }
+
+        // Then try the soft reference cache
+        SoftReference<Bitmap> bitmapReference = sSoftBitmapCache.get(url);
+        if (bitmapReference != null) {
+            final Bitmap bitmap = bitmapReference.get();
+            if (bitmap != null) {
+                // Bitmap found in soft cache
+                return bitmap;
+            } else {
+                // Soft reference has been Garbage Collected
+                sSoftBitmapCache.remove(url);
+            }
+        }
+
+        return null;
+    }
+ 
+    /**
+     * Clears the image cache used internally to improve performance. Note that for memory
+     * efficiency reasons, the cache will automatically be cleared after a certain inactivity delay.
+     */
+    public void clearCache() {
+        sHardBitmapCache.clear();
+        sSoftBitmapCache.clear();
+    }
+
+    /**
+     * Allow a new delay before the automatic cache clear is done.
+     */
+    private void resetPurgeTimer() {
+        purgeHandler.removeCallbacks(purger);
+        purgeHandler.postDelayed(purger, DELAY_BEFORE_PURGE);
+    }
+
 }
