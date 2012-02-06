@@ -16,47 +16,32 @@
 
 package com.bitfable.ammocache.download;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
 import java.lang.ref.SoftReference;
 import java.lang.ref.WeakReference;
-import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
-import java.net.URL;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.apache.http.util.ByteArrayBuffer;
-
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.AsyncTask;
-import android.os.Build;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.util.Log;
 import android.widget.ImageView;
 
-import com.bitfable.ammocache.io.FlushedInputStream;
-
 /**
- * Use this class to download images and load them onto ImageView instances.
- * You can configure the HTTP cache size used by changing
- * {@link #HTTP_CACHE_SIZE}. In-memory cache size item count limit can be
+ * Extends this class to create an image downloader. Images will automatically
+ * be cached in-memory. The in-memory cache size item count limit can be
  * configured by changing {@link #HARD_CACHE_CAPACITY}. In-memory LRU cache can
  * be set to auto-purge itself to save meory. This is configured with
  * {@link #DELAY_BEFORE_PURGE}.
  * 
- * Many of the network optimizations in this code came from an Android Developer
- * Blog article by Jesse Wilson:
- * 
- * http://android-developers.blogspot.com/2011/09/androids-http-clients.html
+ * See {@link UrlImageDownloader} for an example implementation
  * 
  * The {@link AsyncTask} workflow and in-memory cache is based on code from
  * Gilles Debunne:
@@ -65,12 +50,7 @@ import com.bitfable.ammocache.io.FlushedInputStream;
  * http://code.google.com/p/android-imagedownloader/
  * 
  */
-public class ImageDownloader {
-	/**
-	 * The size of the cache shared by {@link HttpURLConnection}
-	 */
-	private static final long HTTP_CACHE_SIZE = 5 * 1024 * 1024; // 5 MiB
-	
+abstract public class AbstractImageDownloader {
 	/**
 	 * Minimum amount of time between updates for the {@link ProgressListener}
 	 */
@@ -79,7 +59,7 @@ public class ImageDownloader {
 	/**
 	 * Max number of items allowed inside in-memory LRU cache
 	 */
-    private static final int HARD_CACHE_CAPACITY = 32;
+    private static final int HARD_CACHE_CAPACITY = 64;
     
     /**
      * Amount of time of inactivity to wait before purging in-memory cache, set
@@ -87,129 +67,112 @@ public class ImageDownloader {
      */
     private static final int DELAY_BEFORE_PURGE = -1; // 10 * 1000; // in milliseconds
 
-	private static final int BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE = 1048;
-	private static final String CACHE_FILE_NAME = "image_downloader_cache";
-	private static final String TAG = "ImageDownloader";
-	
+	private static final String TAG = "AbstractImageDownloader";
+
+	public static final String KEY_PROGRESS = "KEY_PROGRESS";
+	public static final String KEY_ELAPSED_TIME = "KEY_ELAPSED_TIME";
+	private Handler mHandler;
+
 	@SuppressWarnings("unused")
-	private ImageDownloader() { }
+	private AbstractImageDownloader() { }
 	
-	public ImageDownloader(Context context) {
-		disableConnectionReuseIfNecessary();
-		
-		if (context != null) {
-			enableHttpResponseCache(context);
-		}
+	protected AbstractImageDownloader(Context context) {
+		mHandler = new Handler(context.getMainLooper());
 	}
 	
-	/**
-	 * Prior to Froyo, HttpURLConnection had some frustrating bugs. In
-	 * particular, calling close() on a readable InputStream could poison the
-	 * connection pool. Work around this by disabling connection pooling.
-	 */
-	private void disableConnectionReuseIfNecessary() {
-	    // HTTP connection reuse which was buggy pre-froyo
-	    if (Integer.parseInt(Build.VERSION.SDK) < Build.VERSION_CODES.FROYO) {
-	        System.setProperty("http.keepAlive", "false");
-	    }
+	public void download(String key, ImageView imageView) {
+		download(key, imageView, null, null);
 	}
 	
-	/**
-	 * Use reflection to enable HTTP response caching on devices that support
-	 * it. This sample code will turn on the response cache on Ice Cream
-	 * Sandwich without affecting earlier releases.
-	 */
-	private void enableHttpResponseCache(Context context) {
-		File cacheDir = context.getCacheDir();
-		if (cacheDir == null) {
-			Log.w(TAG, "cache directory could not be found");
-			return;
-		}
-		
-	    try {
-	        long httpCacheSize = HTTP_CACHE_SIZE;
-	        File httpCacheDir = new File(cacheDir, CACHE_FILE_NAME);
-	        Class.forName("android.net.http.HttpResponseCache")
-	            .getMethod("install", File.class, long.class)
-	            .invoke(null, httpCacheDir, httpCacheSize);
-	    } catch (Exception httpResponseCacheNotAvailable) {
-	    	Log.v(TAG, "HttpResponseCache is not available");
-	    }
+	public void download(String key, ImageView imageView, Bitmap defaultBitmap) {
+		download(key, imageView, defaultBitmap, null);
 	}
 	
-	public void download(String imageUrl, ImageView imageView) {
-		download(imageUrl, imageView, null);
+	public void download(String key, ImageView imageView, ProgressListener progressListener) {
+		download(key, imageView, null, progressListener);
 	}
 	
-	public void download(String imageUrl, ImageView imageView, ProgressListener progressListener) {
+	public void download(String key, ImageView imageView, Bitmap defaultBitmap, ProgressListener progressListener) {
         resetPurgeTimer();
-        Bitmap bitmap = getBitmapFromCache(imageUrl);
+        Bitmap bitmap = getBitmapFromCache(key);
 
         if (bitmap == null) {
-            forceDownload(imageUrl, imageView, progressListener);
+            forceDownload(key, imageView, defaultBitmap, progressListener);
         } else {
-            cancelPotentialDownload(imageUrl, imageView);
+            cancelPotentialDownload(key, imageView);
             imageView.setImageBitmap(bitmap);
-            if (progressListener != null) progressListener.onProgressUpdated(100, 0);
+            if (progressListener != null) progressListener.onProgressUpdated(100, 0L);
         }
-	}
-	
+	}	
 
     /**
      * Same as download but the image is always downloaded and the cache is not used.
      * Kept private at the moment as its interest is not clear.
      */
-    private void forceDownload(String imageUrl, ImageView imageView, ProgressListener progressListener) {
-        // State sanity: url is guaranteed to never be null in DownloadedDrawable and cache keys.
-        if (imageUrl == null) {
+    private void forceDownload(String key, ImageView imageView, Bitmap defaultBitmap, ProgressListener progressListener) {
+        // State sanity: key is guaranteed to never be null in DownloadedDrawable and cache keys.
+    	if (key == null) {
             imageView.setImageDrawable(null);
             return;
         }
 
-        if (cancelPotentialDownload(imageUrl, imageView)) {
-	         ImageDownloadTask task = new ImageDownloadTask(imageUrl, imageView, progressListener);
-	         DownloadedDrawable downloadedDrawable = new DownloadedDrawable(task);
+        if (cancelPotentialDownload(key, imageView)) {
+	         ImageDownloadTask task = new ImageDownloadTask(key, imageView, progressListener);
+	        
+	         // Default cyan background drawable
+	         Drawable downloadedDrawable;
+	         if (defaultBitmap == null) {
+	        	 downloadedDrawable = new DownloadedDrawable(task);
+	         } else {
+	        	 downloadedDrawable = new DefaultImageDrawable(task, defaultBitmap);
+	         }
+	         
 	         imageView.setImageDrawable(downloadedDrawable);
 	         task.execute();
         }
     }
 
-    private static boolean cancelPotentialDownload(String url, ImageView imageView) {
+    private static boolean cancelPotentialDownload(String key, ImageView imageView) {
 		ImageDownloadTask downloadTask = getDownloadTask(imageView);
-
+		
 	    if (downloadTask != null) {
-	        String bitmapUrl = downloadTask.url;
-	        if ((bitmapUrl == null) || (!bitmapUrl.equals(url))) {
+	        if (downloadTask.mKey == null || !downloadTask.mKey.equals(key)) {
 	            downloadTask.cancel(true);
+	            downloadTask.setProgressListener(null);
 	        } else {
-	            // The same URL is already being downloaded.
+	            // The same image is already being downloaded.
 	            return false;
 	        }
 	    }
+	    
 	    return true;
 	}
 	
-	private static ImageDownloadTask getDownloadTask(ImageView imageView) {
-	    if (imageView != null) {
+	private static ImageDownloadTask getDownloadTask(ImageView imageView) {		
+		if (imageView != null) {
 	        Drawable drawable = imageView.getDrawable();
+	        
 	        if (drawable instanceof DownloadedDrawable) {
-	            DownloadedDrawable downloadedDrawable = (DownloadedDrawable)drawable;
+	            DownloadedDrawable downloadedDrawable = (DownloadedDrawable) drawable;
 	            return downloadedDrawable.getDownloadTask();
+	        } else if (drawable instanceof DefaultImageDrawable) {
+	        	DefaultImageDrawable defaultImageDrawable = (DefaultImageDrawable) drawable;
+	        	return defaultImageDrawable.getDownloadTask();
 	        }
 	    }
-	    return null;
+		
+		return null;
 	}
 	
     private final class ImageDownloadTask extends AsyncTask<Void, Void, Bitmap> {
-		String url;
+		String mKey;
     	private WeakReference<ImageView> mImageViewReference;
-    	private int mBytesDownloaded;
-		private int mContentLength;
 		private ProgressListener mProgressListener;
 		private long mTimeBegin;
+		private long mLastUpdateTime;
 
-		public ImageDownloadTask(String imageUrl, ImageView imageView, ProgressListener progressListener) {
-    		url = imageUrl;
+		public ImageDownloadTask(String key, ImageView imageView, ProgressListener progressListener) {
+    		mKey = key;
     		mImageViewReference = new WeakReference<ImageView>(imageView);
     		mProgressListener = progressListener;
     		mTimeBegin = SystemClock.elapsedRealtime();
@@ -217,22 +180,36 @@ public class ImageDownloader {
 
 		@Override
 		protected Bitmap doInBackground(Void... params) {
-			return downloadImage(url);
+			return downloadImage();
 		}
 		
-		@Override
-		protected void onProgressUpdate(Void... values) {
-			if (mContentLength <= 0 || mProgressListener == null) return;
+		public void publishProgress(final int progress) {
+			if (mProgressListener == null) return;
 			
-			long timeNow = SystemClock.elapsedRealtime();
-			mProgressListener.onProgressUpdated(mBytesDownloaded * 100 / mContentLength, timeNow - mTimeBegin);
+			if (progress < 100 && SystemClock.elapsedRealtime() - mLastUpdateTime < PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI) {
+				return;
+			} else {
+				mLastUpdateTime = SystemClock.elapsedRealtime();
+			}
+			
+			mHandler.post(new Runnable() {
+				@Override
+				public void run() {
+					if (mProgressListener == null) {
+						return;
+					}
+					
+					long elapsedTime = mLastUpdateTime - mTimeBegin;
+					mProgressListener.onProgressUpdated(progress, elapsedTime);
+				}
+			});
 		}
-    	
+		
 		@Override
 		protected void onPostExecute(Bitmap bitmap) {
 			if (isCancelled()) bitmap = null;
 			
-			addBitmapToCache(url, bitmap);
+			addBitmapToCache(mKey, bitmap);
 			
 			if (bitmap != null) {
 			    ImageView imageView = mImageViewReference.get();
@@ -242,62 +219,43 @@ public class ImageDownloader {
 			        imageView.setImageBitmap(bitmap);
 			    }
 			} else {
-				Log.w(TAG, "could not download bitmap: " + url);
+				Log.w(TAG, "could not download bitmap: " + mKey);
 			}
 		}
 		
-	    private Bitmap downloadImage(String imageUrl) {
-	    	URL url;
-	    	
-			try {
-				url = new URL(imageUrl);
-			} catch (MalformedURLException e) {
-				Log.e(TAG, "url is malformed: " + imageUrl, e);
-				return null;
-			}
-			
-	    	HttpURLConnection urlConnection;
-			try {
-				urlConnection = (HttpURLConnection) url.openConnection();
-			} catch (IOException e) {
-				Log.e(TAG, "error while opening connection", e);
-				return null;
-			}
-			
-	    	Bitmap bitmap = null;
-	    	InputStream httpStream = null;
-	    	try {
-	    		mContentLength = urlConnection.getContentLength();
-	    		httpStream = new FlushedInputStream(urlConnection.getInputStream());
-	    		ByteArrayBuffer baf = new ByteArrayBuffer(BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE);
-	    		byte[] buffer = new byte[BYTE_ARRAY_BUFFER_INCREMENTAL_SIZE];
-	    		while (!isCancelled()) {
-	    			int incrementalRead = httpStream.read(buffer);
-	    			if (incrementalRead == -1) {
-	    				break;
-	    			}
-	    			mBytesDownloaded += incrementalRead;
-	    			if (SystemClock.elapsedRealtime() - mTimeBegin > PUBLISH_PROGRESS_TIME_THRESHOLD_MILLI
-	    					|| mBytesDownloaded == mContentLength) {
-	    				publishProgress();
-	    			}
-	    			baf.append(buffer, 0, incrementalRead);
-	    		}
-
-	    		if (isCancelled()) return null;
-	    		
-	    	    bitmap = BitmapFactory.decodeByteArray(baf.toByteArray(), 0, baf.length());
-	    	} catch (IOException e) {
-				Log.e(TAG, "error creating InputStream", e);
-			} finally {
-				if (urlConnection != null) urlConnection.disconnect();
-				if (httpStream != null) {
-					try { httpStream.close(); } catch (IOException e) { Log.e(TAG, "IOException while closing http stream", e); }
-				}
-			}
-
-	    	return bitmap;
+	    private Bitmap downloadImage() {
+	    	return download(mKey, mImageViewReference);
 	    }
+	    
+		public void setProgressListener(ProgressListener progressListener) {
+			mProgressListener = progressListener;
+		}
+    }
+    
+    abstract protected Bitmap download(String key, WeakReference<ImageView> imageViewRef);
+    
+    protected boolean isCancelled(WeakReference<ImageView> imageViewRef) {
+    	ImageView imageView = imageViewRef.get();
+    	
+    	if (imageView == null) return true;
+    	
+    	ImageDownloadTask task = getDownloadTask(imageView);
+    	
+    	if (task == null) return true;
+    	
+    	return task.isCancelled();
+    }
+    
+    protected void publishProgress(int progress, WeakReference<ImageView> imageViewRef) {
+    	ImageView imageView = imageViewRef.get();
+    	
+    	if (imageView == null) return;
+    	
+    	ImageDownloadTask task = getDownloadTask(imageView);
+    	
+    	if (task == null) return;
+    	
+    	task.publishProgress(progress);
     }
     
     private static final class DownloadedDrawable extends ColorDrawable {
@@ -311,6 +269,19 @@ public class ImageDownloader {
         public ImageDownloadTask getDownloadTask() {
             return downloadTaskReference.get();
         }
+    }
+    
+    private static final class DefaultImageDrawable extends BitmapDrawable {
+        private WeakReference<ImageDownloadTask> downloadTaskReference = null;
+
+        public DefaultImageDrawable(ImageDownloadTask downloadTask, Bitmap bitmap) {
+        	super(bitmap);
+        	downloadTaskReference = new WeakReference<ImageDownloadTask>(downloadTask);
+		}
+        
+        public ImageDownloadTask getDownloadTask() {
+            return downloadTaskReference.get();
+    	}
     }
     
     public static interface ProgressListener {
@@ -363,33 +334,33 @@ public class ImageDownloader {
      * Adds this bitmap to the cache.
      * @param bitmap The newly downloaded bitmap.
      */
-    private void addBitmapToCache(String url, Bitmap bitmap) {
+    private void addBitmapToCache(String key, Bitmap bitmap) {
         if (bitmap != null) {
             synchronized (sHardBitmapCache) {
-                sHardBitmapCache.put(url, bitmap);
+                sHardBitmapCache.put(key, bitmap);
             }
         }
     }
 
     /**
-     * @param url The URL of the image that will be retrieved from the cache.
+     * @param key The key of the image that will be retrieved from the cache.
      * @return The cached bitmap or null if it was not found.
      */
-    private Bitmap getBitmapFromCache(String url) {
+    private Bitmap getBitmapFromCache(String key) {
         // First try the hard reference cache
         synchronized (sHardBitmapCache) {
-            final Bitmap bitmap = sHardBitmapCache.get(url);
+            final Bitmap bitmap = sHardBitmapCache.get(key);
             if (bitmap != null) {
                 // Bitmap found in hard cache
                 // Move element to first position, so that it is removed last
-                sHardBitmapCache.remove(url);
-                sHardBitmapCache.put(url, bitmap);
+                sHardBitmapCache.remove(key);
+                sHardBitmapCache.put(key, bitmap);
                 return bitmap;
             }
         }
 
         // Then try the soft reference cache
-        SoftReference<Bitmap> bitmapReference = sSoftBitmapCache.get(url);
+        SoftReference<Bitmap> bitmapReference = sSoftBitmapCache.get(key);
         if (bitmapReference != null) {
             final Bitmap bitmap = bitmapReference.get();
             if (bitmap != null) {
@@ -397,7 +368,7 @@ public class ImageDownloader {
                 return bitmap;
             } else {
                 // Soft reference has been Garbage Collected
-                sSoftBitmapCache.remove(url);
+                sSoftBitmapCache.remove(key);
             }
         }
 
@@ -408,7 +379,7 @@ public class ImageDownloader {
      * Clears the image cache used internally to improve performance. Note that for memory
      * efficiency reasons, the cache will automatically be cleared after a certain inactivity delay.
      */
-    public void clearCache() {
+    protected void clearCache() {
         sHardBitmapCache.clear();
         sSoftBitmapCache.clear();
     }

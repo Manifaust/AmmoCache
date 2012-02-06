@@ -25,8 +25,9 @@ import android.widget.ImageView;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
-import com.bitfable.ammocache.download.ImageDownloader;
-import com.bitfable.ammocache.download.ImageDownloader.ProgressListener;
+import com.bitfable.ammocache.download.AbstractImageDownloader;
+import com.bitfable.ammocache.download.AbstractImageDownloader.ProgressListener;
+import com.bitfable.ammocache.download.UrlImageDownloader;
 
 public class ExampleImageAdapter extends BaseAdapter {
 	private static final String MILLISECONDS_STRING = " milliseconds";
@@ -83,10 +84,10 @@ public class ExampleImageAdapter extends BaseAdapter {
         "http://lh4.ggpht.com/_7V85eCJY_fg/TBpXudG4_PI/AAAAAAAAPEE/8cHJ7G84TkM/s144-c/20100530_120257_0273-Edit-2.jpg"
     };
 	private LayoutInflater mInflater;
-	private ImageDownloader mImageDownloader;
+	private UrlImageDownloader mImageDownloader;
 	
 	public ExampleImageAdapter(Context context) {
-		mImageDownloader = new ImageDownloader(context);
+		mImageDownloader = new UrlImageDownloader(context);
 	}
 
 	@Override
@@ -118,6 +119,7 @@ public class ExampleImageAdapter extends BaseAdapter {
     	String url = (String) getItem(position);
 		final ProgressBar progress = (ProgressBar) view.findViewById(R.id.progress);
 		progress.setMax(MAX_PROGRESS_PERCENT);
+		progress.setProgress(0);
 		final TextView percent = (TextView) view.findViewById(R.id.percent);
 		percent.setText(ZERO_PERCENT_STRING);
 		final TextView time = (TextView) view.findViewById(R.id.time);

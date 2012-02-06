@@ -1,7 +1,7 @@
 AmmoCache is an Android image cache. Please look at LaunchActivity.java and
 ExampleImageAdapter.java to see example usage. Configuration constants are
-located in ImageDownloader.java, please look at its class documentation for more
-detail.
+located in AbstractImageDownloader.java and UrlImageDownloader.java, please look
+at their class documentation for more detail.
 
 This source code is released under the Apache License Version 2.0.
 
